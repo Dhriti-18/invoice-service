@@ -1,0 +1,547 @@
+openapi: 3.0.3
+info:
+  title: Invoice & Payment Service
+  version: "1.0.0"
+  description: |
+    A minimal invoice + payment service. A business authenticates with an API
+    key; every resource below is scoped to that business. See DESIGN.md in
+    the repo root for the state machine, concurrency/idempotency guarantees,
+    and webhook signing scheme.
+
+servers:
+  - url: http://localhost:8080
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: customers
+  - name: invoices
+  - name: payments
+  - name: webhooks
+  - name: health
+
+paths:
+  /health:
+    get:
+      tags: [health]
+      summary: Liveness check
+      security: []
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: ok
+
+  /customers:
+    post:
+      tags: [customers]
+      summary: Create a customer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateCustomerRequest"
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Customer"
+        "400":
+          $ref: "#/components/responses/Error"
+        "401":
+          $ref: "#/components/responses/Error"
+    get:
+      tags: [customers]
+      summary: List customers for the authenticated business
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Customer"
+        "401":
+          $ref: "#/components/responses/Error"
+
+  /customers/{id}:
+    get:
+      tags: [customers]
+      summary: Get a customer by ID
+      parameters:
+        - $ref: "#/components/parameters/PathId"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Customer"
+        "404":
+          $ref: "#/components/responses/Error"
+
+  /invoices:
+    post:
+      tags: [invoices]
+      summary: Create an invoice
+      description: >
+        total_amount_cents is always computed server-side from line_items;
+        any total supplied by the client is ignored. The invoice starts in
+        the 'draft' state.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateInvoiceRequest"
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InvoiceWithLineItems"
+        "400":
+          $ref: "#/components/responses/Error"
+    get:
+      tags: [invoices]
+      summary: List invoices for the authenticated business
+      parameters:
+        - name: state
+          in: query
+          required: false
+          description: Filter by invoice state
+          schema:
+            $ref: "#/components/schemas/InvoiceState"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Invoice"
+        "400":
+          $ref: "#/components/responses/Error"
+
+  /invoices/{id}:
+    get:
+      tags: [invoices]
+      summary: Get an invoice and its line items
+      parameters:
+        - $ref: "#/components/parameters/PathId"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InvoiceWithLineItems"
+        "404":
+          $ref: "#/components/responses/Error"
+
+  /invoices/{id}/finalize:
+    post:
+      tags: [invoices]
+      summary: Transition an invoice draft -> open
+      description: Only valid from 'draft'. Makes the invoice payable.
+      parameters:
+        - $ref: "#/components/parameters/PathId"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Invoice"
+        "409":
+          description: Invoice is not in 'draft'
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "404":
+          $ref: "#/components/responses/Error"
+
+  /invoices/{id}/void:
+    post:
+      tags: [invoices]
+      summary: Transition an invoice draft or open -> void
+      description: Terminal. Means "this was never actually owed."
+      parameters:
+        - $ref: "#/components/parameters/PathId"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Invoice"
+        "409":
+          description: Invoice is not in 'draft' or 'open'
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "404":
+          $ref: "#/components/responses/Error"
+
+  /invoices/{id}/mark_uncollectible:
+    post:
+      tags: [invoices]
+      summary: Transition an invoice open -> uncollectible
+      description: >
+        Terminal. Means "this was legitimately open and unpaid, and the
+        business has given up trying to collect it" -- distinct from void.
+      parameters:
+        - $ref: "#/components/parameters/PathId"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Invoice"
+        "409":
+          description: Invoice is not in 'open'
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "404":
+          $ref: "#/components/responses/Error"
+
+  /invoices/{id}/pay:
+    post:
+      tags: [payments]
+      summary: Attempt to pay an invoice
+      description: >
+        Only valid when the invoice is 'open'. Records a payment attempt,
+        calls the mock PSP, and updates invoice state based on the result.
+        Requires a unique Idempotency-Key per logical payment attempt;
+        retrying the same key with the same body replays the original
+        response without a second PSP call (see DESIGN.md section 3).
+      parameters:
+        - $ref: "#/components/parameters/PathId"
+        - name: Idempotency-Key
+          in: header
+          required: true
+          description: Client-generated key scoping this payment attempt.
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PayInvoiceRequest"
+      responses:
+        "200":
+          description: PSP call resolved (succeeded or failed) -- see status field.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PaymentAttempt"
+        "202":
+          description: >
+            PSP call did not resolve in time (or a network error left the
+            outcome ambiguous and was conservatively marked failed
+            separately -- see DESIGN.md 3b). The attempt is left 'pending';
+            retry the same Idempotency-Key later to check status.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PaymentAttempt"
+        "409":
+          description: >
+            Invoice is not payable in its current state, a payment is
+            already in flight for this invoice, or this Idempotency-Key
+            was already used with a different request body.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "400":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+
+  /webhooks/endpoints:
+    post:
+      tags: [webhooks]
+      summary: Register a webhook endpoint
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RegisterWebhookEndpointRequest"
+      responses:
+        "201":
+          description: >
+            Created. The signing secret is returned once, here, and never
+            shown again.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WebhookEndpointWithSecret"
+        "400":
+          $ref: "#/components/responses/Error"
+    get:
+      tags: [webhooks]
+      summary: List registered webhook endpoints
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/WebhookEndpoint"
+
+  /webhooks/deliveries:
+    get:
+      tags: [webhooks]
+      summary: List webhook delivery attempts (for reconciling missed events)
+      responses:
+        "200":
+          description: OK, newest first, capped at 200 rows.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/WebhookDelivery"
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: "sk_live_<48 hex chars>"
+      description: >
+        Pass the API key returned by the `create-api-key` operator CLI as
+        `Authorization: Bearer sk_live_...`.
+
+  parameters:
+    PathId:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+
+  responses:
+    Error:
+      description: Error response, see ErrorResponse schema
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+
+  schemas:
+    ErrorResponse:
+      type: object
+      description: >
+        Every error from this API uses this consistent shape, regardless of
+        which endpoint or status code.
+      properties:
+        error:
+          type: object
+          properties:
+            type:
+              type: string
+              enum:
+                - invalid_request
+                - not_found
+                - unauthorized
+                - conflict
+                - idempotency_key_reuse
+                - upstream_unavailable
+                - internal_error
+            message:
+              type: string
+      example:
+        error:
+          type: conflict
+          message: invoice is not payable in state 'paid'
+
+    InvoiceState:
+      type: string
+      enum: [draft, open, paid, void, uncollectible]
+
+    Customer:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        business_id: { type: string, format: uuid }
+        name: { type: string }
+        email: { type: string }
+        created_at: { type: string, format: date-time }
+
+    CreateCustomerRequest:
+      type: object
+      required: [name, email]
+      properties:
+        name: { type: string }
+        email: { type: string }
+
+    LineItem:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        invoice_id: { type: string, format: uuid }
+        position: { type: integer }
+        description: { type: string }
+        quantity: { type: integer }
+        unit_amount_cents:
+          type: integer
+          format: int64
+          description: Price per unit, in integer USD cents.
+        amount_cents:
+          type: integer
+          format: int64
+          description: quantity * unit_amount_cents, computed by the database.
+        created_at: { type: string, format: date-time }
+
+    CreateInvoiceLineItem:
+      type: object
+      required: [description, quantity, unit_amount_cents]
+      properties:
+        description: { type: string }
+        quantity: { type: integer, minimum: 1 }
+        unit_amount_cents: { type: integer, format: int64, minimum: 0 }
+
+    CreateInvoiceRequest:
+      type: object
+      required: [customer_id, line_items]
+      properties:
+        customer_id: { type: string, format: uuid }
+        due_date: { type: string, format: date, nullable: true }
+        line_items:
+          type: array
+          minItems: 1
+          items:
+            $ref: "#/components/schemas/CreateInvoiceLineItem"
+
+    Invoice:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        business_id: { type: string, format: uuid }
+        customer_id: { type: string, format: uuid }
+        total_amount_cents:
+          type: integer
+          format: int64
+          description: Server-computed; never trust a client-supplied total.
+        currency: { type: string, example: USD }
+        state:
+          $ref: "#/components/schemas/InvoiceState"
+        due_date: { type: string, format: date, nullable: true }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    InvoiceWithLineItems:
+      type: object
+      properties:
+        invoice:
+          $ref: "#/components/schemas/Invoice"
+        line_items:
+          type: array
+          items:
+            $ref: "#/components/schemas/LineItem"
+
+    PayInvoiceRequest:
+      type: object
+      required: [card_token]
+      properties:
+        card_token:
+          type: string
+          enum:
+            - tok_success
+            - tok_insufficient_funds
+            - tok_card_declined
+            - tok_timeout
+            - tok_network_error
+
+    PaymentAttempt:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        invoice_id: { type: string, format: uuid }
+        business_id: { type: string, format: uuid }
+        status:
+          type: string
+          enum: [pending, succeeded, failed]
+        amount_cents: { type: integer, format: int64 }
+        card_token: { type: string }
+        psp_ref: { type: string, nullable: true }
+        failure_code: { type: string, nullable: true }
+        idempotency_key: { type: string }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    RegisterWebhookEndpointRequest:
+      type: object
+      required: [url]
+      properties:
+        url:
+          type: string
+          format: uri
+          description: Must be an absolute http:// or https:// URL.
+
+    WebhookEndpoint:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        business_id: { type: string, format: uuid }
+        url: { type: string }
+        active: { type: boolean }
+        created_at: { type: string, format: date-time }
+
+    WebhookEndpointWithSecret:
+      allOf:
+        - $ref: "#/components/schemas/WebhookEndpoint"
+        - type: object
+          properties:
+            secret:
+              type: string
+              description: >
+                Hex-encoded signing secret, returned once at creation time
+                and never shown again. Used to verify the
+                X-Webhook-Signature header on delivered events.
+
+    WebhookDelivery:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        business_id: { type: string, format: uuid }
+        endpoint_id: { type: string, format: uuid }
+        event_id: { type: string, format: uuid }
+        event_type:
+          type: string
+          example: invoice.paid
+        payload: { type: object }
+        status:
+          type: string
+          enum: [pending, succeeded, exhausted]
+        attempt_count: { type: integer }
+        next_attempt_at: { type: string, format: date-time }
+        last_error: { type: string, nullable: true }
+        last_response_status: { type: integer, nullable: true }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
